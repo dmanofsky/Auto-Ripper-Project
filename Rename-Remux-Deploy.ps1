@@ -1,13 +1,13 @@
 # ==============================================================================
 # SCRIPT: The Smart Processor (Rename, Remux, Deploy)
-# VERSION: 1.4.2
-# PURPOSE: Scans raw backups, queries TMDB, interactive pre-flight checks,
+# VERSION: 1.5.0
+# PURPOSE: Master Batch Queuing, GUI-style MakeMKV terminal output,
 #          auto-detects resolution/HDR, auto-pulls TMDB episode titles, 
 #          bypasses API bot-blocks (User-Agent), deploys to TrueNAS.
 # ==============================================================================
 
 # --- Configuration ---
-$tmdbApiKey = "YOUR_NEW_TMDB_API_KEY_HERE" # <--- INSERT YOUR NEW KEY HERE
+$tmdbApiKey = "YOUR_NEW_API_KEY_HERE" # <--- INSERT YOUR NEW KEY HERE
 $backupRoot = "D:\media\backups"
 $moviesStaging = "D:\media\movies"
 $showsStaging = "D:\media\shows"
@@ -18,12 +18,10 @@ $truenasShows = "\\TRUENAS\media\shows"
 $truenasBackups = "\\TRUENAS\media\backups"
 
 $makemkvExe = "C:\Program Files (x86)\MakeMKV\makemkvcon.exe"
-
-# The Disguise: Tells TMDB we are a normal Chrome browser, not a PowerShell bot
 $browserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host "     SMART PROCESSOR (v1.4.2) ONLINE     " -ForegroundColor Magenta
+Write-Host "  SMART BATCH PROCESSOR (v1.5.0) ONLINE  " -ForegroundColor Magenta
 Write-Host "=========================================" -ForegroundColor Magenta
 
 $backups = Get-ChildItem -Path $backupRoot -Directory
@@ -33,13 +31,16 @@ if ($backups.Count -eq 0) {
     exit
 }
 
+# The Master Queue holds all jobs until the user approves the entire batch
+$MasterQueue = @()
+
 foreach ($folder in $backups) {
     $volumeName = $folder.Name
     $backupPath = $folder.FullName
     $inputUrl = "file:$backupPath"
     
     Write-Host "`n================================================="
-    Write-Host "PROCESSING RAW BACKUP: $volumeName" -ForegroundColor Cyan
+    Write-Host "PLANNING RAW BACKUP: $volumeName" -ForegroundColor Cyan
     
     $cleanQuery = ($volumeName -replace '_', ' ' -replace 'AC$|UHD$|BLURAY$|DISC\d', '').Trim()
 
@@ -99,7 +100,7 @@ foreach ($folder in $backups) {
     Write-Host "  > Locked in: $finalTitle ($finalYear) {tmdb-$tmdbId}" -ForegroundColor Green
 
     # ==========================================================================
-    # PHASE 2: JAVA SCAN & TARGET SELECTION
+    # PHASE 2: JAVA SCAN & DEEP METADATA EXTRACTION
     # ==========================================================================
     Write-Host "  > Scanning backup structure (Java FPL enabled)..." -ForegroundColor DarkGray
     $debugLogPath = Join-Path $backupRoot "$volumeName-JavaDebug.txt"
@@ -107,14 +108,32 @@ foreach ($folder in $backups) {
     Start-Sleep -Seconds 1
     
     $scanOutput = Get-Content -Path $debugLogPath -ErrorAction SilentlyContinue
-    $parsedTitles = @(); $fplTitleId = -1
+    $titleData = @{}
+    $fplTitleId = -1
 
+    # Replicating the GUI Output
     foreach ($line in $scanOutput) {
         if ($line -match 'TINFO:(\d+),.*FPL_MainFeature') { $fplTitleId = [int]$matches[1] }
-        if ($line -match 'TINFO:(\d+),9,0,"(\d+):(\d+):(\d+)"') {
+        
+        # Regex to capture ID, Code, and Value
+        if ($line -match 'TINFO:(\d+),(\d+),0,"([^"]+)"') {
             $tId = [int]$matches[1]
-            $totalSeconds = ([int]$matches[2] * 3600) + ([int]$matches[3] * 60) + [int]$matches[4]
-            $parsedTitles += [PSCustomObject]@{ Id = $tId; Duration = $totalSeconds }
+            $code = [int]$matches[2]
+            $val = $matches[3]
+            
+            if (-not $titleData.ContainsKey($tId)) { 
+                $titleData[$tId] = @{ Id = $tId; Chapters = "1"; SizeStr = "Unknown"; DurationStr = "0:00:00"; Duration = 0 } 
+            }
+            
+            if ($code -eq 8) { $titleData[$tId].Chapters = $val }
+            if ($code -eq 10) { $titleData[$tId].SizeStr = $val }
+            if ($code -eq 9) { 
+                $titleData[$tId].DurationStr = $val 
+                $parts = $val -split ':'
+                if ($parts.Length -eq 3) {
+                    $titleData[$tId].Duration = ([int]$parts[0] * 3600) + ([int]$parts[1] * 60) + [int]$parts[2]
+                }
+            }
         }
     }
 
@@ -125,16 +144,18 @@ foreach ($folder in $backups) {
         if ($fplTitleId -ne -1) {
             $targetIds += $fplTitleId
         } else {
-            $longestTitle = $parsedTitles | Sort-Object Duration -Descending | Select-Object -First 1
+            # Grab the longest title
+            $longestTitle = $titleData.Values | Sort-Object Duration -Descending | Select-Object -First 1
             $targetIds += $longestTitle.Id
         }
     } else {
-        $episodes = $parsedTitles | Where-Object { $_.Duration -ge 900 -and $_.Duration -le 5400 } | Sort-Object Id
+        $episodes = $titleData.Values | Where-Object { $_.Duration -ge 900 -and $_.Duration -le 5400 } | Sort-Object Id
         
         Write-Host "`n  --- TV SHOW DETECTED ---" -ForegroundColor Cyan
         $seasonNum = [int](Read-Host "  > What Season is this disc? (e.g., 1)")
         
-        $seasonUri = "https://api.themoviedb.org/3/tv/$tmdbId/season/$seasonNum?api_key=$tmdbApiKey"
+        # --- FIX: Formatted String to prevent URI destruction ---
+        $seasonUri = "https://api.themoviedb.org/3/tv/{0}/season/{1}?api_key={2}" -f $tmdbId, $seasonNum, $tmdbApiKey
         try {
             $seasonData = Invoke-RestMethod -Uri $seasonUri -UserAgent $browserAgent -ErrorAction Stop
         } catch {
@@ -144,7 +165,8 @@ foreach ($folder in $backups) {
         
         Write-Host "`n  > Detected the following possible episodes on disc:" -ForegroundColor Yellow
         foreach ($ep in $episodes) {
-            Write-Host "    [ID: $($ep.Id)] - Duration: $([math]::Round($ep.Duration / 60)) mins"
+            # THIS REPLICATES THE MAKEMKV GUI
+            Write-Host "    [ID: $($ep.Id)] - $($ep.Chapters) chapter(s) , $($ep.SizeStr) (Duration: $($ep.DurationStr))"
         }
         
         $keepIdsStr = Read-Host "`n  > Enter comma-separated IDs of the TRUE episodes to keep (e.g., 0, 2, 4)"
@@ -154,14 +176,13 @@ foreach ($folder in $backups) {
     }
 
     # ==========================================================================
-    # PHASE 3: THE PRE-FLIGHT CHECK
+    # PHASE 3: QUALITY DETECTION & NAMING
     # ==========================================================================
     $plannedFiles = @()
     $tempEp = if ($startingEp) { $startingEp } else { 1 }
 
     foreach ($id in $targetIds) {
         
-        # Auto-Quality Detector
         $res = "1080p" 
         $hdr = ""
         $regexRes = 'SINFO:' + $id + ',0,19,0,"(\d+)x'
@@ -213,28 +234,53 @@ foreach ($folder in $backups) {
         $plannedFiles += [PSCustomObject]@{ Id = $id; LocalFolder = $localTargetDir; TrueNASFolder = $truenasTargetDir; FileName = $fileName }
     }
 
-    Write-Host "`n  --- PRE-FLIGHT CHECK ---" -ForegroundColor Cyan
-    foreach ($plan in $plannedFiles) {
+    # Add this entire disc's plan to the Master Queue
+    $MasterQueue += [PSCustomObject]@{
+        VolumeName = $volumeName
+        BackupPath = $backupPath
+        InputUrl = $inputUrl
+        LogPath = $debugLogPath
+        Plans = $plannedFiles
+    }
+}
+
+# ==========================================================================
+# PHASE 4: THE MASTER PRE-FLIGHT CHECK
+# ==========================================================================
+if ($MasterQueue.Count -eq 0) { exit }
+
+Write-Host "`n=================================================" -ForegroundColor Magenta
+Write-Host "         MASTER PRE-FLIGHT CHECK                 " -ForegroundColor Magenta
+Write-Host "=================================================" -ForegroundColor Magenta
+
+foreach ($job in $MasterQueue) {
+    Write-Host "`n  [DISC: $($job.VolumeName)]" -ForegroundColor Yellow
+    foreach ($plan in $job.Plans) {
         Write-Host "  Folder : $($plan.LocalFolder)" -ForegroundColor DarkGray
         Write-Host "  File   : $($plan.FileName)" -ForegroundColor Green
     }
+}
 
-    $confirm = Read-Host "`n  > Approve this batch for remuxing and deployment? (Y/n)"
-    if ($confirm -match '^[nN]') {
-        Write-Host "  > Batch aborted by user. Skipping to next folder..." -ForegroundColor Red
-        Remove-Item -Path $debugLogPath -ErrorAction SilentlyContinue
-        continue
-    }
+$confirm = Read-Host "`n> APPROVE MASTER WORK ORDER for remuxing and deployment? (Y/n)"
+if ($confirm -match '^[nN]') {
+    Write-Host "> Work order aborted. Exiting." -ForegroundColor Red
+    foreach ($job in $MasterQueue) { Remove-Item -Path $job.LogPath -ErrorAction SilentlyContinue }
+    exit
+}
 
-    # ==========================================================================
-    # PHASE 4: REMUX & DEPLOYMENT
-    # ==========================================================================
-    foreach ($plan in $plannedFiles) {
+# ==========================================================================
+# PHASE 5: BATCH EXECUTION (Remux, Deploy, Cleanup)
+# ==========================================================================
+foreach ($job in $MasterQueue) {
+    Write-Host "`n================================================="
+    Write-Host "EXECUTING JOB: $($job.VolumeName)" -ForegroundColor Cyan
+    
+    foreach ($plan in $job.Plans) {
         if (-not (Test-Path $plan.LocalFolder)) { New-Item -ItemType Directory -Path $plan.LocalFolder | Out-Null }
-        Write-Host "`n  > Ripping: $($plan.FileName)" -ForegroundColor Magenta
+        Write-Host "  > Ripping: $($plan.FileName)" -ForegroundColor Magenta
         
         $filesBefore = @(Get-ChildItem -Path $plan.LocalFolder -Filter "*.mkv")
-        & $makemkvExe mkv $inputUrl $plan.Id $plan.LocalFolder | Out-Null
+        & $makemkvExe mkv $job.InputUrl $plan.Id $plan.LocalFolder | Out-Null
         $filesAfter = @(Get-ChildItem -Path $plan.LocalFolder -Filter "*.mkv")
         $newFile = $filesAfter | Where-Object { $filesBefore.FullName -notcontains $_.FullName }
         
@@ -246,21 +292,25 @@ foreach ($folder in $backups) {
         }
     }
     
-    $lastLocalFolder = $plannedFiles[-1].LocalFolder
-    if ($lastLocalFolder -ne "" -and (Test-Path $lastLocalFolder) -and (Get-ChildItem $lastLocalFolder).Count -eq 0) {
-        Remove-Item -Path $lastLocalFolder -Force
-        $parentDir = Split-Path $lastLocalFolder
-        if ((Test-Path $parentDir) -and (Get-ChildItem $parentDir).Count -eq 0) { Remove-Item -Path $parentDir -Force }
+    # Cleanup empty staging folders for this job
+    if ($job.Plans.Count -gt 0) {
+        $lastLocalFolder = $job.Plans[-1].LocalFolder
+        if ($lastLocalFolder -ne "" -and (Test-Path $lastLocalFolder) -and (Get-ChildItem $lastLocalFolder).Count -eq 0) {
+            Remove-Item -Path $lastLocalFolder -Force
+            $parentDir = Split-Path $lastLocalFolder
+            if ((Test-Path $parentDir) -and (Get-ChildItem $parentDir).Count -eq 0) { Remove-Item -Path $parentDir -Force }
+        }
     }
 
-    # ==========================================================================
-    # PHASE 5: RAW BACKUP DEPLOYMENT
-    # ==========================================================================
     Write-Host "  > Moving raw backup folder to TrueNAS Backups share..." -ForegroundColor Cyan
-    $nasBackupDir = Join-Path $truenasBackups $volumeName
-    $roboBackupArgs = @("$backupPath", "$nasBackupDir", "/E", "/MOVE", "/J", "/NP")
+    $nasBackupDir = Join-Path $truenasBackups $job.VolumeName
+    $roboBackupArgs = @("$($job.BackupPath)", "$nasBackupDir", "/E", "/MOVE", "/J", "/NP")
     & robocopy @roboBackupArgs | Out-Null
-    Remove-Item -Path $debugLogPath -ErrorAction SilentlyContinue
-    Write-Host "================================================="
-    Write-Host "Finished processing $finalTitle! The raw backup and MKVs have been moved to TrueNAS." -ForegroundColor Green
+    
+    Remove-Item -Path $job.LogPath -ErrorAction SilentlyContinue
+    Write-Host "Finished Job: $($job.VolumeName)" -ForegroundColor Green
 }
+
+Write-Host "`n=================================================" -ForegroundColor Magenta
+Write-Host "  BATCH QUEUE COMPLETE. ALL JOBS DEPLOYED.       " -ForegroundColor Magenta
+Write-Host "=================================================" -ForegroundColor Magenta
