@@ -7,7 +7,7 @@
 # ==============================================================================
 
 # --- Configuration ---
-$tmdbApiKey = "API KEY HERE" # <--- INSERT YOUR KEY HERE
+$tmdbApiKey = "YOUR_TMDB_API_KEY_HERE" # <--- INSERT YOUR KEY HERE
 $backupRoot = "D:\media\backups"
 $moviesStaging = "D:\media\movies"
 $showsStaging = "D:\media\shows"
