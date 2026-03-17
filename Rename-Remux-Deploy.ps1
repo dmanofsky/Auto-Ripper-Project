@@ -1,9 +1,9 @@
 # ==============================================================================
 # SCRIPT: The Smart Processor (Rename, Remux, Deploy)
-# VERSION: 1.2.1
+# VERSION: 1.3.0
 # PURPOSE: Scans raw backups, queries TMDB, interactive pre-flight checks,
-#          remuxes MKVs with TRaSH Guide standards, deploys to TrueNAS via 
-#          Robocopy, and cleans up local staging folders.
+#          auto-detects resolution & HDR from MakeMKV logs, remuxes MKVs 
+#          with TRaSH Guide standards, deploys to TrueNAS via Robocopy.
 # ==============================================================================
 
 # --- Configuration ---
@@ -20,7 +20,7 @@ $truenasBackups = "\\TRUENAS\media\backups"
 $makemkvExe = "C:\Program Files (x86)\MakeMKV\makemkvcon.exe"
 
 Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host "     SMART PROCESSOR (v1.2.1) ONLINE     " -ForegroundColor Magenta
+Write-Host "     SMART PROCESSOR (v1.3.0) ONLINE     " -ForegroundColor Magenta
 Write-Host "=========================================" -ForegroundColor Magenta
 
 $backups = Get-ChildItem -Path $backupRoot -Directory
@@ -38,7 +38,6 @@ foreach ($folder in $backups) {
     Write-Host "`n================================================="
     Write-Host "PROCESSING RAW BACKUP: $volumeName" -ForegroundColor Cyan
     
-    # --- FIX: Proper .NET string method for Trim() ---
     $cleanQuery = ($volumeName -replace '_', ' ' -replace 'AC$|UHD$|BLURAY$|DISC\d', '').Trim()
 
     # ==========================================================================
@@ -122,18 +121,38 @@ foreach ($folder in $backups) {
         $targetIds = $episodes.Id
     }
 
-    # Ask the user for the Quality Suffix
-    Write-Host "`n  --- QUALITY TAGGING ---" -ForegroundColor Yellow
-    $qualitySuffix = Read-Host "  > Enter Quality Suffix (e.g., 2160p Remux HDR, or 1080p Remux)"
-    if ([string]::IsNullOrWhiteSpace($qualitySuffix)) { $qualitySuffix = "1080p Remux" } # Fallback default
-
     # ==========================================================================
-    # PHASE 3: THE PRE-FLIGHT CHECK (Dry Run Confirmation)
+    # PHASE 3: THE PRE-FLIGHT CHECK (Auto-Quality & Dry Run)
     # ==========================================================================
     $plannedFiles = @()
     $tempEp = if ($startingEp) { $startingEp } else { 1 }
 
     foreach ($id in $targetIds) {
+        
+        # --- NEW FEATURE: AUTO QUALITY DETECTOR ---
+        $res = "1080p" # Fallback Default
+        $hdr = ""
+        
+        # Regex patterns to search the MakeMKV log specifically for THIS title ID
+        $regexRes = 'SINFO:' + $id + ',0,19,0,"(\d+)x'
+        $regexHdr = 'SINFO:' + $id + ',0,.*?(HDR|HDR10|Dolby Vision|BT\.2020|SMPTE2084)'
+        
+        foreach ($line in $scanOutput) {
+            if ($line -match $regexRes) {
+                $width = [int]$matches[1]
+                if ($width -ge 3200) { $res = "2160p" }
+                elseif ($width -ge 1900) { $res = "1080p" }
+                elseif ($width -ge 1200) { $res = "720p" }
+                else { $res = "480p" }
+            }
+            if ($line -match $regexHdr) {
+                $hdr = " HDR"
+            }
+        }
+        
+        $qualitySuffix = "$res Remux$hdr"
+        # ------------------------------------------
+
         if ($selectedMedia.media_type -eq 'movie') {
             $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
             $fileName = "$finalTitle ($finalYear) {tmdb-$tmdbId} - $qualitySuffix.mkv"
