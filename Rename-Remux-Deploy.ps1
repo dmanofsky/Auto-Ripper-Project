@@ -1,12 +1,13 @@
 # ==============================================================================
-# SCRIPT 2: THE SMART PROCESSOR (Rename, Remux, Deploy)
-# PURPOSE: Scans raw backups, queries TMDB, remuxes MKVs with TMDB IDs, 
-#          uses Robocopy to deploy MKVs and raw backups to TrueNAS, 
-#          and automatically cleans up the local NVMe staging folders.
+# SCRIPT: The Smart Processor (Rename, Remux, Deploy)
+# VERSION: 1.2.1
+# PURPOSE: Scans raw backups, queries TMDB, interactive pre-flight checks,
+#          remuxes MKVs with TRaSH Guide standards, deploys to TrueNAS via 
+#          Robocopy, and cleans up local staging folders.
 # ==============================================================================
 
 # --- Configuration ---
-$tmdbApiKey = "YOUR_TMDB_API_KEY_HERE" # <--- INSERT YOUR KEY HERE
+$tmdbApiKey = "API KEY HERE" # <--- INSERT YOUR KEY HERE
 $backupRoot = "D:\media\backups"
 $moviesStaging = "D:\media\movies"
 $showsStaging = "D:\media\shows"
@@ -14,12 +15,12 @@ $showsStaging = "D:\media\shows"
 # TrueNAS Destinations
 $truenasMovies = "\\TRUENAS\media\movies"
 $truenasShows = "\\TRUENAS\media\shows"
-$truenasBackups = "\\TRUENAS\media\backups" # <--- New Backup Destination
+$truenasBackups = "\\TRUENAS\media\backups"
 
 $makemkvExe = "C:\Program Files (x86)\MakeMKV\makemkvcon.exe"
 
 Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host "     SMART PROCESSOR & DEPLOYER ONLINE   " -ForegroundColor Magenta
+Write-Host "     SMART PROCESSOR (v1.2.1) ONLINE     " -ForegroundColor Magenta
 Write-Host "=========================================" -ForegroundColor Magenta
 
 $backups = Get-ChildItem -Path $backupRoot -Directory
@@ -37,7 +38,8 @@ foreach ($folder in $backups) {
     Write-Host "`n================================================="
     Write-Host "PROCESSING RAW BACKUP: $volumeName" -ForegroundColor Cyan
     
-    $cleanQuery = $volumeName -replace '_', ' ' -replace 'AC$|UHD$|BLURAY$|DISC\d', '' | Trim
+    # --- FIX: Proper .NET string method for Trim() ---
+    $cleanQuery = ($volumeName -replace '_', ' ' -replace 'AC$|UHD$|BLURAY$|DISC\d', '').Trim()
 
     # ==========================================================================
     # PHASE 1: TMDB INTERACTIVE SEARCH
@@ -79,14 +81,12 @@ foreach ($folder in $backups) {
     $finalTitle = $finalTitle -replace '[\\/:*?"<>|]', '' 
     $finalDate = if ($selectedMedia.media_type -eq 'movie') { $selectedMedia.release_date } else { $selectedMedia.first_air_date }
     $finalYear = if ($finalDate) { $finalDate.Substring(0,4) } else { "" }
-    
-    # --- FIX 1: CAPTURE THE TMDB ID ---
     $tmdbId = $selectedMedia.id 
 
-    Write-Host "  > Locked in: $finalTitle ($finalYear) [TMDB-$tmdbId]" -ForegroundColor Green
+    Write-Host "  > Locked in: $finalTitle ($finalYear) {tmdb-$tmdbId}" -ForegroundColor Green
 
     # ==========================================================================
-    # PHASE 2: JAVA SCAN & TITLE SELECTION
+    # PHASE 2: JAVA SCAN & METADATA GATHERING
     # ==========================================================================
     Write-Host "  > Scanning backup structure (Java FPL enabled)..." -ForegroundColor DarkGray
     $debugLogPath = Join-Path $backupRoot "$volumeName-JavaDebug.txt"
@@ -122,69 +122,101 @@ foreach ($folder in $backups) {
         $targetIds = $episodes.Id
     }
 
+    # Ask the user for the Quality Suffix
+    Write-Host "`n  --- QUALITY TAGGING ---" -ForegroundColor Yellow
+    $qualitySuffix = Read-Host "  > Enter Quality Suffix (e.g., 2160p Remux HDR, or 1080p Remux)"
+    if ([string]::IsNullOrWhiteSpace($qualitySuffix)) { $qualitySuffix = "1080p Remux" } # Fallback default
+
     # ==========================================================================
-    # PHASE 3: REMUX & DEPLOYMENT
+    # PHASE 3: THE PRE-FLIGHT CHECK (Dry Run Confirmation)
     # ==========================================================================
-    $currentEp = $startingEp
-    $localTargetDir = ""
+    $plannedFiles = @()
+    $tempEp = if ($startingEp) { $startingEp } else { 1 }
 
     foreach ($id in $targetIds) {
-        
-        # --- FIX 1: APPLY TMDB ID TO NAMING CONVENTION ---
         if ($selectedMedia.media_type -eq 'movie') {
             $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
-            $fileName = "$finalTitle ($finalYear) {tmdb-$tmdbId}.mkv"
+            $fileName = "$finalTitle ($finalYear) {tmdb-$tmdbId} - $qualitySuffix.mkv"
             $localTargetDir = Join-Path $moviesStaging $folderName
             $truenasTargetDir = Join-Path $truenasMovies $folderName
         } else {
             $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
             $seasonFolder = "Season $($seasonNum.ToString('D2'))"
-            $fileName = "$finalTitle - S$($seasonNum.ToString('D2'))E$($currentEp.ToString('D2')) {tmdb-$tmdbId}.mkv"
+            
+            $epTitle = Read-Host "    > Enter Episode Title for S$($seasonNum.ToString('D2'))E$($tempEp.ToString('D2')) (Leave blank to skip)"
+            
+            if ([string]::IsNullOrWhiteSpace($epTitle)) {
+                $fileName = "$finalTitle - S$($seasonNum.ToString('D2'))E$($tempEp.ToString('D2')) - $qualitySuffix.mkv"
+            } else {
+                $cleanEpTitle = $epTitle -replace '[\\/:*?"<>|]', '' 
+                $fileName = "$finalTitle - S$($seasonNum.ToString('D2'))E$($tempEp.ToString('D2')) - $cleanEpTitle - $qualitySuffix.mkv"
+            }
+            
             $localTargetDir = Join-Path (Join-Path $showsStaging $folderName) $seasonFolder
             $truenasTargetDir = Join-Path (Join-Path $truenasShows $folderName) $seasonFolder
-            $currentEp++
+            $tempEp++
         }
 
-        if (-not (Test-Path $localTargetDir)) { New-Item -ItemType Directory -Path $localTargetDir | Out-Null }
+        $plannedFiles += [PSCustomObject]@{ 
+            Id = $id; 
+            LocalFolder = $localTargetDir; 
+            TrueNASFolder = $truenasTargetDir; 
+            FileName = $fileName 
+        }
+    }
+
+    Write-Host "`n  --- PRE-FLIGHT CHECK ---" -ForegroundColor Cyan
+    foreach ($plan in $plannedFiles) {
+        Write-Host "  Folder : $($plan.LocalFolder)" -ForegroundColor DarkGray
+        Write-Host "  File   : $($plan.FileName)" -ForegroundColor Green
+    }
+
+    $confirm = Read-Host "`n  > Approve this batch for remuxing and deployment? (Y/n)"
+    if ($confirm -match '^[nN]') {
+        Write-Host "  > Batch aborted by user. Skipping to next folder..." -ForegroundColor Red
+        Remove-Item -Path $debugLogPath -ErrorAction SilentlyContinue
+        continue
+    }
+
+    # ==========================================================================
+    # PHASE 4: REMUX & DEPLOYMENT
+    # ==========================================================================
+    foreach ($plan in $plannedFiles) {
         
-        Write-Host "  > Ripping: $fileName" -ForegroundColor Magenta
+        if (-not (Test-Path $plan.LocalFolder)) { New-Item -ItemType Directory -Path $plan.LocalFolder | Out-Null }
         
-        $filesBefore = @(Get-ChildItem -Path $localTargetDir -Filter "*.mkv")
-        & $makemkvExe mkv $inputUrl $id $localTargetDir | Out-Null
-        $filesAfter = @(Get-ChildItem -Path $localTargetDir -Filter "*.mkv")
+        Write-Host "`n  > Ripping: $($plan.FileName)" -ForegroundColor Magenta
+        
+        $filesBefore = @(Get-ChildItem -Path $plan.LocalFolder -Filter "*.mkv")
+        & $makemkvExe mkv $inputUrl $plan.Id $plan.LocalFolder | Out-Null
+        $filesAfter = @(Get-ChildItem -Path $plan.LocalFolder -Filter "*.mkv")
         $newFile = $filesAfter | Where-Object { $filesBefore.FullName -notcontains $_.FullName }
         
         if ($newFile) { 
-            Rename-Item -Path $newFile[0].FullName -NewName $fileName 
+            Rename-Item -Path $newFile[0].FullName -NewName $plan.FileName 
             
-            # --- FIX 3: ROBOCOPY FOR MKV DEPLOYMENT & CLEANUP ---
             Write-Host "  > Deploying MKV to TrueNAS via Robocopy..." -ForegroundColor Cyan
-            # /MOV moves files and deletes them from the source. /J uses unbuffered I/O (great for large files). /NP hides progress spam.
-            $roboArgs = @("$localTargetDir", "$truenasTargetDir", "$fileName", "/MOV", "/J", "/NP")
+            $roboArgs = @("$($plan.LocalFolder)", "$($plan.TrueNASFolder)", "$($plan.FileName)", "/MOV", "/J", "/NP")
             & robocopy @roboArgs | Out-Null
         }
     }
     
-    # Clean up the empty local staging folder if Robocopy moved everything successfully
-    if ($localTargetDir -ne "" -and (Test-Path $localTargetDir) -and (Get-ChildItem $localTargetDir).Count -eq 0) {
-        Remove-Item -Path $localTargetDir -Force
-        # Also try removing the parent Show folder if it's now empty
-        $parentDir = Split-Path $localTargetDir
+    $lastLocalFolder = $plannedFiles[-1].LocalFolder
+    if ($lastLocalFolder -ne "" -and (Test-Path $lastLocalFolder) -and (Get-ChildItem $lastLocalFolder).Count -eq 0) {
+        Remove-Item -Path $lastLocalFolder -Force
+        $parentDir = Split-Path $lastLocalFolder
         if ((Test-Path $parentDir) -and (Get-ChildItem $parentDir).Count -eq 0) { Remove-Item -Path $parentDir -Force }
     }
 
     # ==========================================================================
-    # PHASE 4: RAW BACKUP DEPLOYMENT & CLEANUP
+    # PHASE 5: RAW BACKUP DEPLOYMENT & CLEANUP
     # ==========================================================================
-    # --- FIX 2: MOVE RAW BDMV FOLDER TO NAS ---
     Write-Host "  > Moving raw backup folder to TrueNAS Backups share..." -ForegroundColor Cyan
     $nasBackupDir = Join-Path $truenasBackups $volumeName
     
-    # /MOVE deletes files AND directories from the source after copying. /E copies subdirectories (even empty ones).
     $roboBackupArgs = @("$backupPath", "$nasBackupDir", "/E", "/MOVE", "/J", "/NP")
     & robocopy @roboBackupArgs | Out-Null
     
-    # Cleanup the Java log
     Remove-Item -Path $debugLogPath -ErrorAction SilentlyContinue
     
     Write-Host "================================================="
