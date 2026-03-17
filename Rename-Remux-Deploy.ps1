@@ -1,9 +1,9 @@
 # ==============================================================================
 # SCRIPT: The Smart Processor (Rename, Remux, Deploy)
-# VERSION: 1.3.0
+# VERSION: 1.4.0
 # PURPOSE: Scans raw backups, queries TMDB, interactive pre-flight checks,
-#          auto-detects resolution & HDR from MakeMKV logs, remuxes MKVs 
-#          with TRaSH Guide standards, deploys to TrueNAS via Robocopy.
+#          auto-detects resolution/HDR, auto-pulls TMDB episode titles, 
+#          remuxes MKVs with TRaSH Guide standards, deploys to TrueNAS.
 # ==============================================================================
 
 # --- Configuration ---
@@ -20,7 +20,7 @@ $truenasBackups = "\\TRUENAS\media\backups"
 $makemkvExe = "C:\Program Files (x86)\MakeMKV\makemkvcon.exe"
 
 Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host "     SMART PROCESSOR (v1.3.0) ONLINE     " -ForegroundColor Magenta
+Write-Host "     SMART PROCESSOR (v1.4.0) ONLINE     " -ForegroundColor Magenta
 Write-Host "=========================================" -ForegroundColor Magenta
 
 $backups = Get-ChildItem -Path $backupRoot -Directory
@@ -85,7 +85,7 @@ foreach ($folder in $backups) {
     Write-Host "  > Locked in: $finalTitle ($finalYear) {tmdb-$tmdbId}" -ForegroundColor Green
 
     # ==========================================================================
-    # PHASE 2: JAVA SCAN & METADATA GATHERING
+    # PHASE 2: JAVA SCAN & TARGET SELECTION
     # ==========================================================================
     Write-Host "  > Scanning backup structure (Java FPL enabled)..." -ForegroundColor DarkGray
     $debugLogPath = Join-Path $backupRoot "$volumeName-JavaDebug.txt"
@@ -105,6 +105,7 @@ foreach ($folder in $backups) {
     }
 
     $targetIds = @()
+    $seasonData = $null
 
     if ($selectedMedia.media_type -eq 'movie') {
         if ($fplTitleId -ne -1) {
@@ -114,26 +115,38 @@ foreach ($folder in $backups) {
             $targetIds += $longestTitle.Id
         }
     } else {
+        # --- FIX: TV SHOW MANUAL SELECTION & TMDB AUTO-PULL ---
         $episodes = $parsedTitles | Where-Object { $_.Duration -ge 900 -and $_.Duration -le 5400 } | Sort-Object Id
-        Write-Host "    > Found $($episodes.Count) possible TV Episodes on this disc." -ForegroundColor Cyan
-        $seasonNum = [int](Read-Host "    > What Season is this disc? (e.g., 1)")
-        $startingEp = [int](Read-Host "    > What is the starting Episode Number? (e.g., 1)")
-        $targetIds = $episodes.Id
+        
+        Write-Host "`n  --- TV SHOW DETECTED ---" -ForegroundColor Cyan
+        $seasonNum = [int](Read-Host "  > What Season is this disc? (e.g., 1)")
+        
+        # Download the Season Episode List from TMDB
+        $seasonUri = "https://api.themoviedb.org/3/tv/$tmdbId/season/$seasonNum?api_key=$tmdbApiKey"
+        $seasonData = Invoke-RestMethod -Uri $seasonUri -ErrorAction SilentlyContinue
+        
+        Write-Host "`n  > Detected the following possible episodes on disc:" -ForegroundColor Yellow
+        foreach ($ep in $episodes) {
+            Write-Host "    [ID: $($ep.Id)] - Duration: $([math]::Round($ep.Duration / 60)) mins"
+        }
+        
+        $keepIdsStr = Read-Host "`n  > Enter comma-separated IDs of the TRUE episodes to keep (e.g., 0, 2, 4)"
+        $targetIds = $keepIdsStr -split ',' | ForEach-Object { [int]$_.Trim() }
+        
+        $startingEp = [int](Read-Host "  > What is the starting Episode Number? (e.g., 1)")
     }
 
     # ==========================================================================
-    # PHASE 3: THE PRE-FLIGHT CHECK (Auto-Quality & Dry Run)
+    # PHASE 3: THE PRE-FLIGHT CHECK
     # ==========================================================================
     $plannedFiles = @()
     $tempEp = if ($startingEp) { $startingEp } else { 1 }
 
     foreach ($id in $targetIds) {
         
-        # --- NEW FEATURE: AUTO QUALITY DETECTOR ---
-        $res = "1080p" # Fallback Default
+        # Auto-Quality Detector
+        $res = "1080p" 
         $hdr = ""
-        
-        # Regex patterns to search the MakeMKV log specifically for THIS title ID
         $regexRes = 'SINFO:' + $id + ',0,19,0,"(\d+)x'
         $regexHdr = 'SINFO:' + $id + ',0,.*?(HDR|HDR10|Dolby Vision|BT\.2020|SMPTE2084)'
         
@@ -145,14 +158,11 @@ foreach ($folder in $backups) {
                 elseif ($width -ge 1200) { $res = "720p" }
                 else { $res = "480p" }
             }
-            if ($line -match $regexHdr) {
-                $hdr = " HDR"
-            }
+            if ($line -match $regexHdr) { $hdr = " HDR" }
         }
-        
         $qualitySuffix = "$res Remux$hdr"
-        # ------------------------------------------
-
+        
+        # Naming Logic
         if ($selectedMedia.media_type -eq 'movie') {
             $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
             $fileName = "$finalTitle ($finalYear) {tmdb-$tmdbId} - $qualitySuffix.mkv"
@@ -162,7 +172,12 @@ foreach ($folder in $backups) {
             $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
             $seasonFolder = "Season $($seasonNum.ToString('D2'))"
             
-            $epTitle = Read-Host "    > Enter Episode Title for S$($seasonNum.ToString('D2'))E$($tempEp.ToString('D2')) (Leave blank to skip)"
+            # --- FIX: AUTO-PULL EPISODE TITLE FROM TMDB ---
+            $epTitle = ""
+            if ($seasonData -and $seasonData.episodes) {
+                $tmdbEp = $seasonData.episodes | Where-Object { $_.episode_number -eq $tempEp }
+                if ($tmdbEp) { $epTitle = $tmdbEp.name }
+            }
             
             if ([string]::IsNullOrWhiteSpace($epTitle)) {
                 $fileName = "$finalTitle - S$($seasonNum.ToString('D2'))E$($tempEp.ToString('D2')) - $qualitySuffix.mkv"
@@ -176,12 +191,7 @@ foreach ($folder in $backups) {
             $tempEp++
         }
 
-        $plannedFiles += [PSCustomObject]@{ 
-            Id = $id; 
-            LocalFolder = $localTargetDir; 
-            TrueNASFolder = $truenasTargetDir; 
-            FileName = $fileName 
-        }
+        $plannedFiles += [PSCustomObject]@{ Id = $id; LocalFolder = $localTargetDir; TrueNASFolder = $truenasTargetDir; FileName = $fileName }
     }
 
     Write-Host "`n  --- PRE-FLIGHT CHECK ---" -ForegroundColor Cyan
@@ -201,9 +211,7 @@ foreach ($folder in $backups) {
     # PHASE 4: REMUX & DEPLOYMENT
     # ==========================================================================
     foreach ($plan in $plannedFiles) {
-        
         if (-not (Test-Path $plan.LocalFolder)) { New-Item -ItemType Directory -Path $plan.LocalFolder | Out-Null }
-        
         Write-Host "`n  > Ripping: $($plan.FileName)" -ForegroundColor Magenta
         
         $filesBefore = @(Get-ChildItem -Path $plan.LocalFolder -Filter "*.mkv")
@@ -213,7 +221,6 @@ foreach ($folder in $backups) {
         
         if ($newFile) { 
             Rename-Item -Path $newFile[0].FullName -NewName $plan.FileName 
-            
             Write-Host "  > Deploying MKV to TrueNAS via Robocopy..." -ForegroundColor Cyan
             $roboArgs = @("$($plan.LocalFolder)", "$($plan.TrueNASFolder)", "$($plan.FileName)", "/MOV", "/J", "/NP")
             & robocopy @roboArgs | Out-Null
@@ -228,16 +235,13 @@ foreach ($folder in $backups) {
     }
 
     # ==========================================================================
-    # PHASE 5: RAW BACKUP DEPLOYMENT & CLEANUP
+    # PHASE 5: RAW BACKUP DEPLOYMENT
     # ==========================================================================
     Write-Host "  > Moving raw backup folder to TrueNAS Backups share..." -ForegroundColor Cyan
     $nasBackupDir = Join-Path $truenasBackups $volumeName
-    
     $roboBackupArgs = @("$backupPath", "$nasBackupDir", "/E", "/MOVE", "/J", "/NP")
     & robocopy @roboBackupArgs | Out-Null
-    
     Remove-Item -Path $debugLogPath -ErrorAction SilentlyContinue
-    
     Write-Host "================================================="
     Write-Host "Finished processing $finalTitle! The raw backup and MKVs have been moved to TrueNAS." -ForegroundColor Green
 }
