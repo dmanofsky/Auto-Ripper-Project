@@ -1,9 +1,9 @@
 # ==============================================================================
 # SCRIPT: The Smart Processor (Rename, Remux, Deploy)
-# VERSION: 1.5.2
+# VERSION: 1.5.3
 # PURPOSE: Master Batch Queuing, GUI-style MakeMKV terminal output,
-#          bulletproof HDR fallback logic for UHD discs, auto-pulls TMDB 
-#          episode titles, bypasses API bot-blocks, deploys to TrueNAS.
+#          bulletproof HDR fallback, auto-pulls TMDB episode titles, 
+#          natively applies Jellyfin [tmdbid-1234] bracket syntax.
 # ==============================================================================
 
 # --- Configuration ---
@@ -21,7 +21,7 @@ $makemkvExe = "C:\Program Files (x86)\MakeMKV\makemkvcon.exe"
 $browserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host "  SMART BATCH PROCESSOR (v1.5.2) ONLINE  " -ForegroundColor Magenta
+Write-Host "  SMART BATCH PROCESSOR (v1.5.3) ONLINE  " -ForegroundColor Magenta
 Write-Host "=========================================" -ForegroundColor Magenta
 
 $backups = Get-ChildItem -Path $backupRoot -Directory
@@ -97,7 +97,8 @@ foreach ($folder in $backups) {
     $finalYear = if ($finalDate) { $finalDate.Substring(0,4) } else { "" }
     $tmdbId = $selectedMedia.id 
 
-    Write-Host "  > Locked in: $finalTitle ($finalYear) {tmdb-$tmdbId}" -ForegroundColor Green
+    # --- JELLYFIN SYNTAX UPDATE ---
+    Write-Host "  > Locked in: $finalTitle ($finalYear) [tmdbid-$tmdbId]" -ForegroundColor Green
 
     # ==========================================================================
     # PHASE 2: JAVA SCAN & DEEP METADATA EXTRACTION
@@ -181,7 +182,6 @@ foreach ($folder in $backups) {
         $res = "1080p" 
         $hdr = ""
         
-        # Expanded Regex to catch the 10-bit HEVC profile used for HDR
         $regexRes = '^SINFO:' + $id + ',\d+,19,\d+,"(\d+)x'
         $regexHdr = '(?i)^SINFO:' + $id + ',\d+,.*?(HDR|Dolby Vision|BT\.?2020|SMPTE|Main 10)'
         
@@ -196,22 +196,20 @@ foreach ($folder in $backups) {
             if ($line -match $regexHdr) { $hdr = " HDR" }
         }
 
-        # --- FIX: The "Dumb Disc" Fallback ---
-        # If MakeMKV's quick-scan skipped the deep colorimetry packets, we 
-        # force the HDR tag for 2160p because all raw 4K rips are HDR natively.
         if ($res -eq "2160p" -and $hdr -eq "") {
             $hdr = " HDR"
         }
         
         $qualitySuffix = "$res Remux$hdr"
         
+        # --- JELLYFIN SYNTAX UPDATE ---
         if ($selectedMedia.media_type -eq 'movie') {
-            $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
-            $fileName = "$finalTitle ($finalYear) {tmdb-$tmdbId} - $qualitySuffix.mkv"
+            $folderName = "$finalTitle ($finalYear) [tmdbid-$tmdbId]"
+            $fileName = "$finalTitle ($finalYear) [tmdbid-$tmdbId] - $qualitySuffix.mkv"
             $localTargetDir = Join-Path $moviesStaging $folderName
             $truenasTargetDir = Join-Path $truenasMovies $folderName
         } else {
-            $folderName = "$finalTitle ($finalYear) {tmdb-$tmdbId}"
+            $folderName = "$finalTitle ($finalYear) [tmdbid-$tmdbId]"
             $seasonFolder = "Season $($seasonNum.ToString('D2'))"
             
             $epTitle = ""
