@@ -66,7 +66,6 @@ for TARGET_DIR in "${TARGET_DIRS[@]}"; do
         # ==========================================================================
         res="Unknown"
         
-        # --- BUG FIX: Fully expanded if/elif block to prevent token errors ---
         if [ "$width" -ge 3200 ] || [ "$height" -ge 2100 ]; then 
             res="2160p"
         elif [ "$width" -ge 1900 ] || [ "$height" -ge 1000 ]; then 
